@@ -16,6 +16,8 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include "stream_logger_config.h"
+
 #include <boost/asio.hpp>
 
 #include <boost/filesystem.hpp>
@@ -25,8 +27,20 @@
 
 #include <boost/program_options.hpp>
 
-#include <unistd.h>
-
+#if defined(BOOST_ASIO_HAS_POSIX_STREAM_DESCRIPTOR)
+# if !HAS_UNISTD_H
+#  error "Need unistd.h header"
+# endif
+# include <unistd.h>
+#elif defined(BOOST_ASIO_HAS_WINDOWS_STREAM_HANDLE)
+# if !HAS_GETSTDHANDLE
+#  error "GetStdHandle not available!"
+# endif
+# define WIN32_LEAN_AND_MEAN
+# include <windows.h>
+#else
+# error "Stream descriptors not available"
+#endif
 #include <fstream>
 #include <functional>
 #include <iomanip>
@@ -68,6 +82,11 @@ std::string get_logfilename(const std::string &prefix, unsigned nb, logfiletype 
 }
 
 struct process_handler {
+    boost::asio::io_context &ios;
+
+    boost::filesystem::path exe;
+    std::vector<std::string> args;
+
     std::unique_ptr<bp::child> child;
     bp::async_pipe pin;
     bp::async_pipe pout;
@@ -75,7 +94,11 @@ struct process_handler {
     std::vector<char> buffer_pout;
     std::vector<char> buffer_perr;
 
+#if defined(BOOST_ASIO_HAS_POSIX_STREAM_DESCRIPTOR)
     boost::asio::posix::stream_descriptor in;
+#elif defined(BOOST_ASIO_HAS_WINDOWS_STREAM_HANDLE)
+    boost::asio::windows::stream_handle in;
+#endif
     std::vector<char> buffer_stdin;
 
     std::ofstream olog_in;
@@ -99,22 +122,42 @@ struct process_handler {
     }
 
     process_handler(boost::asio::io_context &ios, const std::string &exe, const std::vector<std::string> &args, const std::string &name_prefix, unsigned lognumber)
-    : pin(ios)
+    : ios(ios)
+    , args(args)
+    , pin(ios)
     , pout(ios)
     , perr(ios)
     , buffer_pout(4096)
     , buffer_perr(4096)
-    , in(ios, ::dup(STDIN_FILENO))
     , buffer_stdin(4096)
+#if defined(BOOST_ASIO_HAS_POSIX_STREAM_DESCRIPTOR)
+    , in(ios, ::dup(STDIN_FILENO)
+#elif defined(BOOST_ASIO_HAS_WINDOWS_STREAM_HANDLE)
+    , in(ios)
+#endif
     , olog_in(get_logfilename(name_prefix, lognumber, LOG_INPUT))
     , olog_out(get_logfilename(name_prefix, lognumber, LOG_OUTPUT))
     , olog_err(get_logfilename(name_prefix, lognumber, LOG_ERROR)) {
 
         boost::filesystem::path exep = exe;
         if (!boost::filesystem::exists(exe)) {
-            exep = bp::search_path(exe);
+            this->exe = bp::search_path(exe);
         }
-        child = std::make_unique<bp::child>(bp::exe=exep, bp::args=args, bp::std_in=pin, bp::std_out=pout, bp::std_err=perr, ios, bp::on_exit=std::bind(&process_handler::on_exit, this, std::placeholders::_1, std::placeholders::_2));
+        
+    }
+
+    void run() {
+#if defined(BOOST_ASIO_HAS_WINDOWS_STREAM_HANDLE)
+        try {
+            in.assign(GetStdHandle(STD_INPUT_HANDLE));
+        }
+        catch (boost::system::system_error &e) {
+            std::cerr << e.what() << "\n";
+            throw;
+        }
+#endif
+
+        child = std::make_unique<bp::child>(bp::exe = exe, bp::args = args, bp::std_in = pin, bp::std_out = pout, bp::std_err = perr, ios, bp::on_exit = std::bind(&process_handler::on_exit, this, std::placeholders::_1, std::placeholders::_2));
 
         in.async_read_some(boost::asio::buffer(buffer_stdin), std::bind(&process_handler::on_stdin_available, this, std::placeholders::_1, std::placeholders::_2));
         pout.async_read_some(boost::asio::buffer(buffer_pout), std::bind(&process_handler::on_process_out_available, this, std::placeholders::_1, std::placeholders::_2));
@@ -227,11 +270,18 @@ int main(int argc, const char *argv[]) {
 
     boost::asio::io_context ios;
 
-    process_handler handler(ios, exe, args, name_prefix, log_i);
+
+    std::unique_ptr<process_handler> handler;
+
+    boost::asio::post(ios, [&]() {
+        handler = std::make_unique<process_handler>(ios, exe, args, name_prefix, log_i);
+        handler->run();
+    });
+    //process_handler handler(ios, exe, args, name_prefix, log_i);
 
     ios.run();
 
-    handler.child->wait();
+    handler->child->wait();
 
-    return handler.child->exit_code();
+    return handler->child->exit_code();
 }
